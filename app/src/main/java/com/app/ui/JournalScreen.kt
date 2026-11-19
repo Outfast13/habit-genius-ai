@@ -1,9 +1,12 @@
 package com.app.ui
 
+import android.content.Intent
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,14 +18,21 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import com.app.journal.JournalAttachment
 import com.app.journal.JournalEntry
 import com.app.journal.JournalState
 import com.app.journal.JournalStorage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -31,6 +41,106 @@ import java.util.Locale
 import java.util.UUID
 
 private val MOOD_OPTIONS = listOf("Focused", "Calm", "Neutral", "Tired", "Stressed")
+
+private fun isImageAttachment(att: JournalAttachment): Boolean {
+    return att.mimeType.startsWith("image/", ignoreCase = true) ||
+        att.displayName.lowercase(Locale.ROOT).let {
+            it.endsWith(".jpg") || it.endsWith(".jpeg") || it.endsWith(".png") || it.endsWith(".webp")
+        }
+}
+
+@Composable
+private fun InlinePhotoPreview(localPath: String) {
+    val bitmap by produceState<ImageBitmap?>(initialValue = null, key1 = localPath) {
+        value = withContext(Dispatchers.IO) {
+            val file = File(localPath)
+            if (!file.exists()) return@withContext null
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = 4
+            }
+            BitmapFactory.decodeFile(file.absolutePath, opts)?.asImageBitmap()
+        }
+    }
+
+    bitmap?.let { img ->
+        Image(
+            bitmap = img,
+            contentDescription = "Journal photo preview",
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(160.dp)
+                .clip(RoundedCornerShape(10.dp))
+        )
+    }
+}
+
+@Composable
+private fun AttachmentRow(
+    att: JournalAttachment,
+    onOpen: (JournalAttachment) -> Unit,
+    onRemove: (() -> Unit)? = null
+) {
+    val accentGreen = Color(0xFF7FD18B)
+    val rowDark = Color(0xFF111512)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(rowDark, RoundedCornerShape(10.dp))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (isImageAttachment(att)) {
+            InlinePhotoPreview(localPath = att.localPath)
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = att.displayName,
+                    color = accentGreen,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = "${att.mimeType} • ${att.sizeBytes} B",
+                    color = Color(0xFF9FB0A3),
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Open",
+                    color = accentGreen,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .clickable { onOpen(att) }
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+
+                if (onRemove != null) {
+                    Text(
+                        text = "✕",
+                        color = Color(0xFFE57373),
+                        modifier = Modifier
+                            .clickable { onRemove() }
+                            .padding(horizontal = 4.dp)
+                    )
+                }
+            }
+        }
+    }
+}
 
 @Composable
 fun JournalScreen(
@@ -55,6 +165,33 @@ fun JournalScreen(
     fun commit(newState: JournalState) {
         state = newState
         onStateChanged(newState)
+    }
+
+    fun openAttachment(att: JournalAttachment) {
+        attachError = null
+        val file = File(att.localPath)
+        if (!file.exists()) {
+            attachError = "Attachment file not found on device."
+            return
+        }
+
+        val launchResult = runCatching {
+            val authority = "${context.packageName}.fileprovider"
+            val contentUri = FileProvider.getUriForFile(context, authority, file)
+            val resolvedMime = att.mimeType.ifBlank {
+                context.contentResolver.getType(contentUri) ?: "*/*"
+            }
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(contentUri, resolvedMime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(Intent.createChooser(intent, "Open ${att.displayName}"))
+        }
+
+        launchResult.onFailure {
+            attachError = "No app available to open ${att.displayName}."
+        }
     }
 
     fun copyUriToJournalStorage(uri: Uri) {
@@ -150,14 +287,13 @@ fun JournalScreen(
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = "Text, mood tags, and photo/audio/video/file attachments",
+                    text = "Inline photo previews + open actions for media & files",
                     color = Color(0xFFB7D4BC),
                     style = MaterialTheme.typography.bodySmall
                 )
             }
         }
 
-        // New Entry Composer
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -253,38 +389,14 @@ fun JournalScreen(
             }
 
             pendingAttachments.forEach { att ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(rowDark, RoundedCornerShape(10.dp))
-                        .padding(horizontal = 10.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = att.displayName,
-                            color = accentGreen,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Text(
-                            text = "${att.mimeType} • ${att.sizeBytes} B",
-                            color = Color(0xFF9FB0A3),
-                            style = MaterialTheme.typography.labelSmall
-                        )
+                AttachmentRow(
+                    att = att,
+                    onOpen = { openAttachment(it) },
+                    onRemove = {
+                        File(att.localPath).delete()
+                        pendingAttachments = pendingAttachments.filterNot { it.id == att.id }
                     }
-                    Text(
-                        text = "✕",
-                        color = Color(0xFFE57373),
-                        modifier = Modifier
-                            .clickable {
-                                File(att.localPath).delete()
-                                pendingAttachments = pendingAttachments.filterNot { it.id == att.id }
-                            }
-                            .padding(horizontal = 6.dp)
-                    )
-                }
+                )
             }
 
             attachError?.let { err ->
@@ -321,7 +433,6 @@ fun JournalScreen(
             }
         }
 
-        // Saved Entries
         if (state.entries.isEmpty()) {
             Box(
                 modifier = Modifier
@@ -379,12 +490,11 @@ fun JournalScreen(
                     }
 
                     if (entry.attachments.isNotEmpty()) {
-                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             entry.attachments.forEach { att ->
-                                Text(
-                                    text = "Attachment: ${att.displayName} (${att.mimeType})",
-                                    color = Color(0xFF9FB0A3),
-                                    style = MaterialTheme.typography.bodySmall
+                                AttachmentRow(
+                                    att = att,
+                                    onOpen = { openAttachment(it) }
                                 )
                             }
                         }
