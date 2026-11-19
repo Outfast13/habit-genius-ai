@@ -1,5 +1,7 @@
 package com.app.ai
 
+import android.util.Base64
+import com.app.habits.TrackerItemType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -17,12 +19,54 @@ data class AiCompletionResult(
     val errors: List<String> = emptyList()
 )
 
+data class ProposedTrackerItem(
+    val title: String,
+    val type: TrackerItemType,
+    val category: String = "General",
+    val reason: String = ""
+)
+
+data class AttachedMediaPayload(
+    val displayName: String,
+    val mimeType: String,
+    val bytes: ByteArray? = null,
+    val sizeBytes: Long = 0L
+) {
+    val isImage: Boolean
+        get() = mimeType.startsWith("image/", ignoreCase = true)
+
+    val isAudio: Boolean
+        get() = mimeType.startsWith("audio/", ignoreCase = true)
+
+    val isVideo: Boolean
+        get() = mimeType.startsWith("video/", ignoreCase = true)
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        other as AttachedMediaPayload
+        return displayName == other.displayName &&
+            mimeType == other.mimeType &&
+            sizeBytes == other.sizeBytes &&
+            bytes.contentEquals(other.bytes)
+    }
+
+    override fun hashCode(): Int {
+        var result = displayName.hashCode()
+        result = 31 * result + mimeType.hashCode()
+        result = 31 * result + sizeBytes.hashCode()
+        result = 31 * result + (bytes?.contentHashCode() ?: 0)
+        return result
+    }
+}
+
 class AiFailoverClient {
 
     suspend fun generateText(
         state: AiSettingsState,
         prompt: String,
-        usePhotoModel: Boolean = false
+        usePhotoModel: Boolean = false,
+        media: AttachedMediaPayload? = null
     ): AiCompletionResult = withContext(Dispatchers.IO) {
         if (!state.isOnline) {
             return@withContext AiCompletionResult(
@@ -33,12 +77,15 @@ class AiFailoverClient {
             )
         }
 
+        val hasImage = media?.isImage == true && media.bytes != null && media.bytes.isNotEmpty()
+        val effectivePrompt = buildMediaAwarePrompt(prompt, media, hasImage)
+
         val providerOrder = buildProviderOrder(state)
         val errors = mutableListOf<String>()
 
         for (provider in providerOrder) {
             val cfg = state.providers[provider] ?: ProviderSettings()
-            val modelId = if (usePhotoModel) {
+            val modelId = if (usePhotoModel || hasImage) {
                 cfg.photoModelId.ifBlank { cfg.photoModel }
             } else {
                 cfg.textModelId.ifBlank { cfg.textModel }
@@ -64,7 +111,15 @@ class AiFailoverClient {
 
             for ((index, key) in keysToTry.withIndex()) {
                 val attempt = runCatching {
-                    callProvider(provider, cfg, modelId, key, prompt)
+                    callProvider(
+                        provider = provider,
+                        cfg = cfg,
+                        modelId = modelId,
+                        apiKey = key,
+                        prompt = effectivePrompt,
+                        imageBytes = if (hasImage) media?.bytes else null,
+                        imageMimeType = media?.mimeType?.ifBlank { "image/jpeg" } ?: "image/jpeg"
+                    )
                 }
 
                 attempt.onSuccess { reply ->
@@ -76,7 +131,7 @@ class AiFailoverClient {
                     )
                 }.onFailure { err ->
                     val labelKey = if (key.isBlank()) "local" else "key#${index + 1}"
-                    errors.add("${provider.label} ($labelKey): ${err.message ?: "request failed"}")
+                    errors.add("${provider.label} ($labelKey):${err.message ?: "request failed"}")
                 }
 
                 if (!state.autoFailover) {
@@ -97,6 +152,116 @@ class AiFailoverClient {
         )
     }
 
+    suspend fun proposeTrackers(
+        state: AiSettingsState,
+        contextNotes: String,
+        media: AttachedMediaPayload? = null
+    ): Pair<AiCompletionResult, List<ProposedTrackerItem>> {
+        val guardPrompt = buildString {
+            appendLine("You are a careful productivity assistant.")
+            appendLine("Extract actionable HABIT or TASK items strictly grounded in the user's input or attached media.")
+            appendLine("Do NOT invent tasks that are not supported by the input. Keep titles concise (max 8 words).")
+            appendLine("Respond ONLY with a valid JSON array of objects using keys: \"title\", \"type\" (\"HABIT\" or \"TASK\"), \"category\", \"reason\".")
+            if (contextNotes.isNotBlank()) {
+                appendLine("User notes: ${contextNotes.trim()}")
+            }
+        }
+
+        val hasImage = media?.isImage == true && media.bytes != null
+        val result = generateText(
+            state = state,
+            prompt = guardPrompt,
+            usePhotoModel = hasImage,
+            media = media
+        )
+
+        if (!result.success || result.text.isBlank()) {
+            return result to emptyList()
+        }
+
+        val parsed = parseProposedItemsSafely(result.text)
+        return result to parsed
+    }
+
+    private fun buildMediaAwarePrompt(
+        basePrompt: String,
+        media: AttachedMediaPayload?,
+        hasImage: Boolean
+    ): String {
+        if (media == null || hasImage) return basePrompt
+
+        val mediaTypeLabel = when {
+            media.isAudio -> "Audio file"
+            media.isVideo -> "Video file"
+            else -> "Attached file"
+        }
+
+        val textSnippet = if (media.bytes != null && media.bytes.isNotEmpty() && isLikelyText(media.mimeType, media.displayName)) {
+            val rawText = String(media.bytes, Charsets.UTF_8).take(4000)
+            "\nFile text preview:\n$rawText"
+        } else {
+            ""
+        }
+
+        return buildString {
+            append(basePrompt)
+            appendLine()
+            appendLine("[$mediaTypeLabel: name=\"${media.displayName}\", mime=\"${media.mimeType}\", bytes=${media.sizeBytes}]")
+            appendLine("Note: Binary audio/video/file streams are not decoded as raw waveforms/frames here; rely on the metadata, file text preview if present, and the user's notes without guessing unseen details.")
+            append(textSnippet)
+        }
+    }
+
+    private fun isLikelyText(mimeType: String, fileName: String): Boolean {
+        val lowerMime = mimeType.lowercase()
+        val lowerName = fileName.lowercase()
+        return lowerMime.startsWith("text/") ||
+            lowerMime.contains("json") ||
+            lowerMime.contains("csv") ||
+            lowerName.endsWith(".txt") ||
+            lowerName.endsWith(".md") ||
+            lowerName.endsWith(".csv") ||
+            lowerName.endsWith(".json")
+    }
+
+    private fun parseProposedItemsSafely(rawText: String): List<ProposedTrackerItem> {
+        val cleaned = rawText
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+
+        val startIdx = cleaned.indexOf('[')
+        val endIdx = cleaned.lastIndexOf(']')
+        if (startIdx == -1 || endIdx <= startIdx) return emptyList()
+
+        val jsonArray = runCatching { JSONArray(cleaned.substring(startIdx, endIdx + 1)) }.getOrNull()
+            ?: return emptyList()
+
+        val safeList = mutableListOf<ProposedTrackerItem>()
+        for (i in 0 until jsonArray.length()) {
+            val obj = jsonArray.optJSONObject(i) ?: continue
+            val title = obj.optString("title", "").trim()
+            if (title.isBlank() || title.length > 100) continue
+
+            val rawType = obj.optString("type", "TASK").trim().uppercase()
+            val type = if (rawType == "HABIT") TrackerItemType.HABIT else TrackerItemType.TASK
+
+            val category = obj.optString("category", "General").trim().ifEmpty { "General" }.take(30)
+            val reason = obj.optString("reason", "").trim().take(140)
+
+            safeList.add(
+                ProposedTrackerItem(
+                    title = title,
+                    type = type,
+                    category = category,
+                    reason = reason
+                )
+            )
+        }
+        return safeList.distinctBy { it.title.lowercase() to it.type }
+    }
+
     private fun buildProviderOrder(state: AiSettingsState): List<AiProvider> {
         if (!state.autoFailover) {
             return listOf(state.activeProvider)
@@ -109,15 +274,21 @@ class AiFailoverClient {
         cfg: ProviderSettings,
         modelId: String,
         apiKey: String,
-        prompt: String
+        prompt: String,
+        imageBytes: ByteArray?,
+        imageMimeType: String
     ): String {
+        val base64Image = imageBytes?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
+
         return when (provider) {
-            AiProvider.GEMINI -> callGemini(modelId, apiKey, prompt)
+            AiProvider.GEMINI -> callGemini(modelId, apiKey, prompt, base64Image, imageMimeType)
             AiProvider.OPEN_ROUTER -> callOpenAiCompatible(
-                endpoint = cfg.baseUrl.ifBlank { "https://openrouter.ai/api/v1/chat/completions" },
+                endpoint = cfg.baseUrl.ifBlank { "[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)" },
                 modelId = modelId,
                 apiKey = apiKey,
                 prompt = prompt,
+                base64Image = base64Image,
+                imageMimeType = imageMimeType,
                 extraHeaders = mapOf("X-Title" to "HabitGenius AI")
             )
             AiProvider.OPENAI_COMPATIBLE -> {
@@ -128,36 +299,49 @@ class AiFailoverClient {
                     endpoint = endpoint,
                     modelId = modelId,
                     apiKey = apiKey,
-                    prompt = prompt
+                    prompt = prompt,
+                    base64Image = base64Image,
+                    imageMimeType = imageMimeType
                 )
             }
             AiProvider.OLLAMA -> {
                 val base = cfg.baseUrl.trim().trimEnd('/')
                 val endpoint = if (base.isEmpty()) {
-                    "http://127.0.0.1:11434/api/generate"
+                    "[http://127.0.0.1:11434/api/generate](http://127.0.0.1:11434/api/generate)"
                 } else if (base.endsWith("/api/generate")) {
                     base
                 } else {
                     "$base/api/generate"
                 }
-                callOllama(endpoint = endpoint, modelId = modelId, prompt = prompt)
+                callOllama(endpoint = endpoint, modelId = modelId, prompt = prompt, base64Image = base64Image)
             }
         }
     }
 
-    private fun callGemini(modelId: String, apiKey: String, prompt: String): String {
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey")
-        val body = JSONObject().apply {
-            put(
-                "contents",
-                JSONArray().put(
-                    JSONObject().put(
-                        "parts",
-                        JSONArray().put(JSONObject().put("text", prompt))
-                    )
+    private fun callGemini(
+        modelId: String,
+        apiKey: String,
+        prompt: String,
+        base64Image: String?,
+        imageMimeType: String
+    ): String {
+        val url = URL("[https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey](https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey)")
+        val partsArray = JSONArray().put(JSONObject().put("text", prompt))
+        if (base64Image != null) {
+            partsArray.put(
+                JSONObject().put(
+                    "inlineData",
+                    JSONObject()
+                        .put("mimeType", imageMimeType)
+                        .put("data", base64Image)
                 )
             )
-        }.toString()
+        }
+
+        val body = JSONObject().put(
+            "contents",
+            JSONArray().put(JSONObject().put("parts", partsArray))
+        ).toString()
 
         val rawResponse = postJson(url.toString(), body, emptyMap())
         val json = JSONObject(rawResponse)
@@ -174,8 +358,25 @@ class AiFailoverClient {
         modelId: String,
         apiKey: String,
         prompt: String,
+        base64Image: String?,
+        imageMimeType: String,
         extraHeaders: Map<String, String> = emptyMap()
     ): String {
+        val contentValue: Any = if (base64Image != null) {
+            JSONArray()
+                .put(JSONObject().put("type", "text").put("text", prompt))
+                .put(
+                    JSONObject()
+                        .put("type", "image_url")
+                        .put(
+                            "image_url",
+                            JSONObject().put("url", "data:$imageMimeType;base64,$base64Image")
+                        )
+                )
+        } else {
+            prompt
+        }
+
         val body = JSONObject().apply {
             put("model", modelId)
             put(
@@ -183,7 +384,7 @@ class AiFailoverClient {
                 JSONArray().put(
                     JSONObject()
                         .put("role", "user")
-                        .put("content", prompt)
+                        .put("content", contentValue)
                 )
             )
         }.toString()
@@ -203,11 +404,19 @@ class AiFailoverClient {
         return content.trim()
     }
 
-    private fun callOllama(endpoint: String, modelId: String, prompt: String): String {
+    private fun callOllama(
+        endpoint: String,
+        modelId: String,
+        prompt: String,
+        base64Image: String?
+    ): String {
         val body = JSONObject().apply {
             put("model", modelId)
             put("prompt", prompt)
             put("stream", false)
+            if (base64Image != null) {
+                put("images", JSONArray().put(base64Image))
+            }
         }.toString()
 
         val rawResponse = postJson(endpoint, body, emptyMap())
