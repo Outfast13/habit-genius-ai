@@ -5,7 +5,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.NavigationBar
@@ -18,15 +17,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.unit.dp
 import com.app.ai.AiSettingsStorage
 import com.app.habits.HabitStorage
 import com.app.habits.TrackerItem
 import com.app.habits.TrackerItemType
 import com.app.journal.JournalStorage
+import com.app.pomodoro.PomodoroStorage
 import com.app.ui.AiWorkspaceScreen
 import com.app.ui.AppSettingsScreen
 import com.app.ui.JournalScreen
+import com.app.ui.PomodoroScreen
 import com.app.ui.SingleTypeTrackerScreen
 import java.util.UUID
 
@@ -46,16 +46,19 @@ class MainActivity : ComponentActivity() {
         val aiStorage = AiSettingsStorage(applicationContext)
         val habitStorage = HabitStorage(applicationContext)
         val journalStorage = JournalStorage(applicationContext)
+        val pomodoroStorage = PomodoroStorage(applicationContext)
 
         val initialAiState = aiStorage.load()
         val initialHabitsState = habitStorage.load()
         val initialJournalState = journalStorage.load()
+        val initialPomodoroState = pomodoroStorage.load()
 
         setContent {
             var currentPage by remember { mutableStateOf(AppPage.HABITS) }
             var aiState by remember { mutableStateOf(initialAiState) }
             var habitsState by remember { mutableStateOf(initialHabitsState) }
             var journalState by remember { mutableStateOf(initialJournalState) }
+            var pomodoroState by remember { mutableStateOf(initialPomodoroState) }
 
             Scaffold(
                 containerColor = Color(0xFF0E110F),
@@ -106,17 +109,13 @@ class MainActivity : ComponentActivity() {
                             }
                         )
 
-                        AppPage.POMODORO -> Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(16.dp)
-                        ) {
-                            Text("Pomodoro Timer", color = Color.White)
-                            Text(
-                                "Next step: focus/break countdown timer.",
-                                color = Color.Gray
-                            )
-                        }
+                        AppPage.POMODORO -> PomodoroScreen(
+                            initialState = pomodoroState,
+                            onStateChanged = { updated ->
+                                pomodoroState = updated
+                                pomodoroStorage.save(updated)
+                            }
+                        )
 
                         AppPage.AI -> AiWorkspaceScreen(
                             aiState = aiState,
@@ -148,5 +147,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+}
     }
 }
