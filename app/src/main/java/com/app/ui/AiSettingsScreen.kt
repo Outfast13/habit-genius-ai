@@ -189,8 +189,7 @@ fun AiSettingsScreen(
                 Button(
                     onClick = {
                         val newKeys = bulkKeyInput
-                            .split(",", "
-", " ")
+                            .split(",", "\n", " ")
                             .map { it.trim() }
                             .filter { it.isNotEmpty() }
                         if (newKeys.isNotEmpty()) {
