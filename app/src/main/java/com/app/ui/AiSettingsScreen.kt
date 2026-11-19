@@ -14,9 +14,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.app.ai.AiCompletionResult
+import com.app.ai.AiFailoverClient
 import com.app.ai.AiProvider
 import com.app.ai.AiSettingsState
 import com.app.ai.ProviderSettings
+import kotlinx.coroutines.launch
 
 @Composable
 fun AiSettingsScreen(
@@ -25,6 +28,12 @@ fun AiSettingsScreen(
 ) {
     var state by remember { mutableStateOf(initialState) }
     var bulkKeyInput by remember { mutableStateOf("") }
+    var testPrompt by remember { mutableStateOf("Reply with OK and your model/provider.") }
+    var testResult by remember { mutableStateOf<AiCompletionResult?>(null) }
+    var isTesting by remember { mutableStateOf(false) }
+
+    val scope = rememberCoroutineScope()
+    val client = remember { AiFailoverClient() }
 
     val currentProvider = state.activeProvider
     val currentConfig = state.providers[currentProvider] ?: ProviderSettings()
@@ -147,6 +156,26 @@ fun AiSettingsScreen(
                 }
             }
 
+            if (currentProvider == AiProvider.OLLAMA || currentProvider == AiProvider.OPENAI_COMPATIBLE) {
+                OutlinedTextField(
+                    value = currentConfig.baseUrl,
+                    onValueChange = { urlVal ->
+                        updateProviderConfig { it.copy(baseUrl = urlVal) }
+                    },
+                    label = {
+                        Text(
+                            if (currentProvider == AiProvider.OLLAMA) {
+                                "Ollama endpoint (default http://127.0.0.1:11434)"
+                            } else {
+                                "Base URL (e.g. https://api.example.com/v1)"
+                            }
+                        )
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
             Text("API keys", color = Color.LightGray, fontWeight = FontWeight.Medium)
 
             currentConfig.apiKeys.forEachIndexed { index, key ->
@@ -230,6 +259,67 @@ fun AiSettingsScreen(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("Save AI Settings", color = Color.Black, fontWeight = FontWeight.Bold)
+            }
+
+            HorizontalDivider(color = Color(0xFF283129))
+
+            Text("Connection Test", color = Color.White, fontWeight = FontWeight.SemiBold)
+
+            OutlinedTextField(
+                value = testPrompt,
+                onValueChange = { testPrompt = it },
+                label = { Text("Test prompt") },
+                singleLine = false,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Button(
+                enabled = !isTesting,
+                onClick = {
+                    onSave(state)
+                    isTesting = true
+                    testResult = null
+                    scope.launch {
+                        testResult = client.generateText(state, testPrompt)
+                        isTesting = false
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (isTesting) "Testing..." else "Save & Test AI")
+            }
+
+            testResult?.let { res ->
+                val boxBg = if (res.success) Color(0xFF1A2E20) else Color(0xFF331919)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(boxBg, RoundedCornerShape(10.dp))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (res.success) {
+                        Text(
+                            text = "Success via ${res.providerUsed?.label.orEmpty()}",
+                            color = accentGreen,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(text = res.text, color = Color.White)
+                    } else {
+                        Text(
+                            text = "Failed",
+                            color = Color(0xFFFF8A80),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        res.errors.forEach { err ->
+                            Text(
+                                text = "• $err",
+                                color = Color(0xFFFFCDD2),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                }
             }
         }
     }
